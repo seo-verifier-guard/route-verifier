@@ -1,0 +1,299 @@
+name: Trusted Route Review (S3 draft)
+
+# SECURITY: This workflow must run only from the protected verifier main.
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Existing ai-auto PR number to review'
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trusted-route-review-${{ inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: trusted-issuer
+    steps:
+      - name: Checkout protected verifier at event SHA
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Check interpreter and protected invocation before authentication
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          python -I - <<'PY'
+          import os, re, sys
+          assert sys.version_info[:2] == (3, 12), 'Python 3.12 required'
+          assert os.environ['GITHUB_REPOSITORY'] == 'seo-verifier-guard/route-verifier'
+          assert os.environ['GITHUB_REF'] == 'refs/heads/main'
+          assert re.fullmatch(r'[1-9][0-9]{0,6}', os.environ['PR_NUMBER']), 'bad PR number'
+          assert re.fullmatch(r'[0-9a-f]{40}', os.environ['GITHUB_SHA'])
+          print('Trusted entrypoint prerequisites verified')
+          PY
+      - name: Mint token only for ai-auto installation
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+        with:
+          app-id: ${{ vars.VERIFIER_APP_ID }}
+          private-key: ${{ secrets.VERIFIER_APP_PRIVATE_KEY }}
+          owner: resetre222-boop
+          repositories: ai-auto
+          permission-checks: write
+          permission-contents: read
+          permission-pull-requests: read
+      - name: Evaluate immutable PR head with pinned S2 checker
+        shell: bash
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EXPECTED_APP_ID: ${{ vars.VERIFIER_APP_ID }}
+        run: |
+          set -euo pipefail
+          python -I - <<'PY'
+          import base64
+          import importlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+          import tempfile
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          OWNER = 'resetre222-boop'
+          REPO = 'ai-auto'
+          FULL_REPO = OWNER + '/' + REPO
+          BASE_BRANCH = 'infra/vps-staging-stable'
+          CHECK_NAME = 'trusted-route-review'
+          APP_TOKEN = os.environ['APP_TOKEN']
+          PR_NUMBER = int(os.environ['PR_NUMBER'])
+          BASE_URL = f'https://api.github.com/repos/{FULL_REPO}'
+          SHA_PATTERN = re.compile(r'[a-f0-9]{40}\Z')
+          PIN = Path('PINNED_SHA').read_text(encoding='ascii').strip()
+          if not SHA_PATTERN.fullmatch(PIN):
+              raise SystemExit('Invalid protected PINNED_SHA')
+          if (sys.version_info[:2] != (3, 12)
+                  or os.environ['GITHUB_REPOSITORY'] != 'seo-verifier-guard/route-verifier'
+                  or os.environ['GITHUB_REF'] != 'refs/heads/main'
+                  or not SHA_PATTERN.fullmatch(os.environ['GITHUB_SHA'])):
+              raise SystemExit('Unsafe workflow runtime')
+          if not APP_TOKEN or not os.environ['EXPECTED_APP_ID'].isdigit():
+              raise SystemExit('Dedicated GitHub App configuration missing')
+
+          def api(method, suffix, payload=None):
+              body = json.dumps(payload).encode('utf-8') if payload is not None else None
+              request = urllib.request.Request(
+                  'https://api.github.com' + suffix,
+                  data=body,
+                  method=method,
+                  headers={
+                      'Authorization': 'Bearer ' + APP_TOKEN,
+                      'Accept': 'application/vnd.github+json',
+                      'X-GitHub-Api-Version': '2022-11-28',
+                      'Content-Type': 'application/json',
+                      'User-Agent': 'independent-route-verifier',
+                  },
+              )
+              with urllib.request.urlopen(request, timeout=15) as response:
+                  return json.load(response)
+
+          def repo_api(method, suffix, payload=None):
+              return api(method, f'/repos/{FULL_REPO}' + suffix, payload)
+
+          def pinned_text(file_path, ref):
+              qpath = urllib.parse.quote(file_path, safe='/')
+              result = repo_api('GET', f'/contents/{qpath}?ref={ref}')
+              if result.get('encoding') != 'base64':
+                  raise ValueError('File content encoding mismatch')
+              return base64.b64decode(result['content'], validate=False)
+
+          def pr_metadata():
+              pr = repo_api('GET', f'/pulls/{PR_NUMBER}')
+              if (pr['state'] != 'open'
+                      or pr['base']['repo']['full_name'] != FULL_REPO
+                      or pr['head']['repo']['full_name'] != FULL_REPO
+                      or pr['base']['ref'] != BASE_BRANCH):
+                  raise ValueError('PR not an open same-repository canonical PR')
+              base, head = pr['base']['sha'], pr['head']['sha']
+              if not SHA_PATTERN.fullmatch(base) or not SHA_PATTERN.fullmatch(head):
+                  raise ValueError('Untrusted commit SHA')
+              return base, head
+
+          def canonical_head():
+              branch = urllib.parse.quote(BASE_BRANCH, safe='')
+              result = repo_api('GET', f'/branches/{branch}')
+              return result['commit']['sha']
+
+          def git_read(repo_dir, *arguments):
+              # Never pass credentials in command-line args or persist them.
+              # The private repository is fetched as immutable commit objects.
+              authorization = base64.b64encode(
+                  ('x-access-token:' + APP_TOKEN).encode('ascii')
+              ).decode('ascii')
+              env = os.environ.copy()
+              env.update({
+                  'GIT_TERMINAL_PROMPT': '0',
+                  'GIT_CONFIG_COUNT': '2',
+                  'GIT_CONFIG_KEY_0': 'http.https://github.com/.extraheader',
+                  'GIT_CONFIG_VALUE_0': 'AUTHORIZATION: basic ' + authorization,
+                  'GIT_CONFIG_KEY_1': 'credential.interactive',
+                  'GIT_CONFIG_VALUE_1': 'never',
+              })
+              return subprocess.run(
+                  ['git', '--git-dir=' + str(repo_dir), *arguments],
+                  env=env, check=True, capture_output=True, timeout=150,
+              ).stdout
+
+          def immutable_changed_files(root, base, head, checker):
+              repo_dir = root / 'private.git'
+              subprocess.run(
+                  ['git', 'init', '--bare', '--quiet', str(repo_dir)],
+                  check=True, capture_output=True, timeout=30,
+              )
+              git_read(repo_dir, 'fetch', '--no-tags', '--quiet',
+                       '--filter=blob:none',
+                       'https://github.com/' + FULL_REPO + '.git', base, head)
+              for expected in (base, head):
+                  observed = git_read(repo_dir, 'rev-parse', expected).decode('ascii').strip()
+                  if observed != expected:
+                      raise ValueError('Fetched commit SHA mismatch')
+              merge_base = git_read(repo_dir, 'merge-base', base, head).decode('ascii').strip()
+              if merge_base != base:
+                  raise ValueError('PR head is not based on current canonical HEAD')
+              raw = git_read(repo_dir, 'diff', '--name-status', '-z',
+                             '--find-renames', '--no-ext-diff', '--no-textconv',
+                             base, head)
+              records = checker.parse_git_name_status(raw)
+              if not records:
+                  raise ValueError('Empty immutable PR diff')
+              # Fail closed early on large diffs, before S2's own 3000-path bound.
+              if len(records) >= 300:
+                  raise ValueError('Too many changed files (300 or more)')
+              return records
+
+          def assert_sync_blobs_unchanged(checker, head):
+              # Independent defense even if the diff/manifest gate is bypassed.
+              for path in sorted(checker.APPROVED_SYNC_PATHS):
+                  quoted = urllib.parse.quote(path, safe='/')
+                  expected = repo_api('GET', f'/contents/{quoted}?ref={PIN}')
+                  actual = repo_api('GET', f'/contents/{quoted}?ref={head}')
+                  if (expected.get('type') != 'file' or actual.get('type') != 'file'
+                          or expected.get('sha') != actual.get('sha')):
+                      raise ValueError('Runtime-sync blob drift: ' + path)
+
+          def issue_check(head, success, summary, detail):
+              if not SHA_PATTERN.fullmatch(head):
+                  raise ValueError('Bad check run SHA')
+              link = ('https://github.com/' + os.environ['GITHUB_REPOSITORY']
+                      + '/actions/runs/' + os.environ['GITHUB_RUN_ID'])
+              result = repo_api('POST', '/check-runs', {
+                  'name': CHECK_NAME,
+                  'head_sha': head,
+                  'status': 'completed',
+                  'conclusion': 'success' if success else 'failure',
+                  'details_url': link,
+                  'output': {'title': CHECK_NAME, 'summary': summary, 'text': detail},
+              })
+              if result.get('head_sha') != head or result.get('name') != CHECK_NAME:
+                  raise ValueError('Check issued to wrong target')
+              if result.get('app', {}).get('id') != int(os.environ['EXPECTED_APP_ID']):
+                  raise ValueError('Unexpected check issuer app_id')
+              return result
+
+          head_for_failure = None
+          try:
+              pr_base, head = pr_metadata()
+              head_for_failure = head
+              base = canonical_head()
+              if not SHA_PATTERN.fullmatch(base):
+                  raise ValueError('Invalid canonical HEAD SHA')
+              # PR base.sha can be stale; use freshly read canonical HEAD.
+              # The immutable Git merge-base check below proves ancestry.
+              if pr_base == head:
+                  raise ValueError('PR base/head identical')
+
+              with tempfile.TemporaryDirectory(prefix='pinned-verifier-') as directory:
+                  root = Path(directory)
+                  checker_dir = root / 'tools'
+                  checker_dir.mkdir()
+                  for source_path in (
+                      'tools/check_s1_legacy_admin_baseline.py',
+                      'tools/check_s1_route_impact.py',
+                      'deploy/vps/ai-auto-user-admin-poller.py',
+                  ):
+                      content = pinned_text(source_path, PIN)
+                      output = root / source_path
+                      output.parent.mkdir(parents=True, exist_ok=True)
+                      output.write_bytes(content)
+
+                  # -I removes injected interpreter paths. Import ONLY files
+                  # acquired from S2 pinned SHA; never import the PR workspace.
+                  sys.path.insert(0, str(checker_dir))
+                  legacy = importlib.import_module('check_s1_legacy_admin_baseline')
+                  checker = importlib.import_module('check_s1_route_impact')
+                  poller = (root / 'deploy/vps/ai-auto-user-admin-poller.py').read_bytes()
+                  if legacy._git_blob_sha(poller) != legacy.CANONICAL_POLLER_BLOB_SHA:
+                      raise ValueError('Pinned source baseline drift')
+                  baseline = legacy.inspect_legacy_dispatch(poller.decode('utf-8'))
+                  if baseline['route_count'] != 69 or baseline['retired_count'] != 15:
+                      raise ValueError('Legacy baseline count mismatch')
+
+                  # The only file inventory we trust comes from a Git diff of
+                  # immutable fetched commit IDs, NOT GitHub's PR-number/files API.
+                  records = immutable_changed_files(root, base, head, checker)
+                  assert_sync_blobs_unchanged(checker, head)
+                  modified_manifest = any(record['filename'] == checker.MANIFEST_PATH
+                                          for record in records)
+                  manifest = None
+                  if modified_manifest:
+                      raw_manifest = pinned_text(checker.MANIFEST_PATH, head)
+                      manifest = json.loads(raw_manifest.decode('utf-8'))
+                  outcome = checker.validate_route_impact(records, manifest)
+                  if outcome['status'] not in ('exempt_only',
+                                               'declaration_checked_not_trusted_b7'):
+                      raise ValueError('Unexpected route review verdict')
+
+              # Both must remain unchanged before issuing a successful check.
+              if (pr_metadata()[1] != head or canonical_head() != base):
+                  raise ValueError('PR HEAD or canonical base moved during run')
+              summary = ('Pinned S2=' + PIN + '; verifier=' + os.environ['GITHUB_SHA']
+                         + '; canonical base=' + base + '; reviewed PR head=' + head)
+              issue_check(head, True, summary,
+                          'Immutable Git diff, pinned AST checks and 8 blob guards passed.')
+              print('SUCCESS: trusted check issued on immutable PR HEAD')
+          except Exception as exc:
+              # Public workflow log contains neither private paths nor errors.
+              # Details go only into the PRIVATE ai-auto check-run output.
+              if head_for_failure is not None:
+                  private_detail = (
+                      type(exc).__name__ + ': ' + str(exc)[:1500]
+                      if isinstance(exc, ValueError)
+                      else type(exc).__name__ + ': verifier internal error'
+                  )
+                  try:
+                      issue_check(head_for_failure, False,
+                                  'Independent route verification failed (fail closed).',
+                                  private_detail)
+                  except Exception:
+                      pass
+              print('FAILED: independent verification did not pass ('
+                    + type(exc).__name__ + ')', file=sys.stderr)
+              raise SystemExit(1) from None
+          PY
